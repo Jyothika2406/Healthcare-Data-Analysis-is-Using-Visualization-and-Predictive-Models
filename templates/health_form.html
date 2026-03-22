@@ -81,10 +81,16 @@
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
                     <!-- Disease Type Selection -->
-                    <div class="form-section-title">🩺 Select Disease Type</div>
+                    <div class="form-section-title">🩺 Select Analysis Type</div>
                     <div class="disease-selector">
-                        <label class="disease-option selected">
-                            <input type="radio" name="disease_type" value="heart" checked>
+                        <label class="disease-option">
+                            <input type="radio" name="disease_type" value="symptoms" checked>
+                            <div class="disease-icon">🔍</div>
+                            <div class="disease-label">Symptom Analysis</div>
+                            <div class="disease-desc">General health risk based on symptoms</div>
+                        </label>
+                        <label class="disease-option">
+                            <input type="radio" name="disease_type" value="heart">
                             <div class="disease-icon">❤️</div>
                             <div class="disease-label">Heart Disease</div>
                             <div class="disease-desc">Cardiovascular risk assessment</div>
@@ -151,11 +157,124 @@
                     </div>
 
                     <!-- Symptoms -->
-                    <div class="form-section-title">📋 Symptoms</div>
+                    <div class="form-section-title">📋 Symptoms & Complaints</div>
                     <div class="form-group">
-                        <label for="symptoms">Describe any symptoms (optional)</label>
-                        <textarea id="symptoms" name="symptoms" class="form-control"
-                                  placeholder="e.g., chest pain, shortness of breath, fatigue..."></textarea>
+                        <label for="symptoms">Describe your symptoms, complaints, or health concerns</label>
+                        <textarea id="symptoms" name="symptoms" class="form-control" rows="5"
+                                  placeholder="Example: chest pain and shortness of breath since 2 days, feeling very tired, headache, etc."></textarea>
+                        <p style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 8px;">
+                            💡 Tip: You can either type your symptoms in your own words, or simply tick them in the checklist below. The system will combine both.
+                        </p>
+                    </div>
+
+                    <!-- Structured Symptom Checklist for Overall Health Risk -->
+                    <div class="form-section-title">🧾 Quick Symptom Checklist (Multi‑Disease)</div>
+                    <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 10px;">
+                        Select all symptoms that apply. These cover general health risk and specific diseases like
+                        Heart Disease, Diabetes, Cancer, Obesity, Hypertension, Kidney / Liver / Respiratory diseases and Mental Health.
+                    </p>
+
+                    <div class="symptom-grid">
+                        <!-- Heart Disease & Hypertension -->
+                        <div class="symptom-card">
+                            <h4>❤️ Heart & Blood Pressure</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="chest pain"> Chest pain</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="chest tightness"> Chest tightness / pressure</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="shortness of breath"> Shortness of breath</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="heart palpitations"> Heart palpitations</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="high blood pressure"> Known high blood pressure</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="dizziness"> Dizziness / light‑headedness</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="severe headache"> Severe headache</label>
+                            </div>
+                        </div>
+
+                        <!-- Diabetes & Metabolic -->
+                        <div class="symptom-card">
+                            <h4>🩸 Diabetes & Metabolic</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="excessive thirst"> Excessive thirst</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="frequent urination"> Frequent urination</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="increased hunger"> Increased hunger</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="blurred vision"> Blurred vision</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="slow healing wounds"> Slow‑healing wounds</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="numbness in feet"> Numbness / tingling in feet</label>
+                            </div>
+                        </div>
+
+                        <!-- Cancer -->
+                        <div class="symptom-card">
+                            <h4>🧬 Cancer Warning Signs</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="unexplained weight loss"> Unexplained weight loss</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="persistent fatigue"> Persistent fatigue</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="persistent cough"> Persistent cough</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="lump"> Any new lump / mass</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="unusual bleeding"> Unusual bleeding</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="night sweats"> Night sweats</label>
+                            </div>
+                        </div>
+
+                        <!-- Kidney & Liver -->
+                        <div class="symptom-card">
+                            <h4>🧪 Kidney & Liver</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="swelling in legs"> Swelling in legs / ankles</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="decreased urine output"> Decreased urine output</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="dark urine"> Dark urine</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="jaundice"> Yellow eyes / skin (jaundice)</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="abdominal swelling"> Abdominal swelling</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="itchy skin"> Persistent itchy skin</label>
+                            </div>
+                        </div>
+
+                        <!-- Respiratory / Asthma -->
+                        <div class="symptom-card">
+                            <h4>🫁 Asthma / Respiratory</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="breathing difficulty"> Breathing difficulty</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="wheezing"> Wheezing / noisy breathing</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="persistent cough"> Long‑standing cough</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="sleep apnea"> Loud snoring / sleep apnea</label>
+                            </div>
+                        </div>
+
+                        <!-- Obesity / Weight -->
+                        <div class="symptom-card">
+                            <h4>⚖️ Obesity & Weight</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="excessive weight gain"> Excessive weight gain</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="difficulty exercising"> Difficulty exercising</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="joint pain"> Joint pain</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="back pain"> Back pain</label>
+                            </div>
+                        </div>
+
+                        <!-- Mental Health -->
+                        <div class="symptom-card">
+                            <h4>🧠 Mental Health</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="anxiety"> Anxiety / excessive worry</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="depression"> Low mood / depression</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="insomnia"> Difficulty sleeping (insomnia)</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="mood swings"> Mood swings</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="social withdrawal"> Social withdrawal</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="difficulty concentrating"> Difficulty concentrating</label>
+                            </div>
+                        </div>
+
+                        <!-- General Symptoms -->
+                        <div class="symptom-card">
+                            <h4>🌡️ General Symptoms</h4>
+                            <div class="checkbox-group">
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="fatigue"> Fatigue / tiredness</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="weakness"> General weakness</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="fever"> Fever</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="nausea"> Nausea</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="vomiting"> Vomiting</label>
+                                <label class="checkbox-item"><input type="checkbox" name="symptom_tags" value="headache"> Headache</label>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- Lifestyle Habits -->

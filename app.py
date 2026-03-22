@@ -50,7 +50,7 @@ from pymongo import MongoClient
 #  App Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'hc-analysis-prod-key-2026-x9f3')
+app.secret_key = os.environ.get('SECRET_KEY', 'new_token')
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
@@ -61,7 +61,7 @@ LOCKOUT_DURATION   = timedelta(minutes=15)
 SESSION_TIMEOUT    = timedelta(minutes=30)
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  MongoDB Connection
+#  MongoDB Connection with Retry Logic
 # ──────────────────────────────────────────────────────────────────────────────
 MONGO_URI = os.environ.get(
     'MONGO_URI',
@@ -72,77 +72,230 @@ MONGO_URI = os.environ.get(
 # Try multiple connection methods for MongoDB
 client = None
 db = None
+mongo_connected = False
+users_col = None
+predictions_col = None
+password_resets = None
+login_attempts_col = None
+
+# In-memory database fallback for Windows development
+class MockCollection:
+    """Mock MongoDB collection for fallback mode."""
+    def __init__(self, name):
+        self.name = name
+        self.data = {}
+
+    def _matches(self, doc, query):
+        if not query:
+            return True
+
+        # Support $or
+        if '$or' in query:
+            return any(self._matches(doc, subq) for subq in query.get('$or', []))
+
+        for key, value in query.items():
+            if key == '$or':
+                continue
+
+            if isinstance(value, dict):
+                # Support operators like $gt
+                if '$gt' in value:
+                    if doc.get(key) is None or not (doc.get(key) > value['$gt']):
+                        return False
+                else:
+                    # Unknown operator block
+                    return False
+            else:
+                if doc.get(key) != value:
+                    return False
+
+        return True
+    
+    def find_one(self, query):
+        """Return first matching document or None."""
+        for doc in self.data.values():
+            if self._matches(doc, query):
+                return doc
+        return None
+    
+    def find(self, query):
+        """Return list of matching documents."""
+        return [doc for doc in self.data.values() if self._matches(doc, query)]
+    
+    def insert_one(self, doc):
+        """Insert document; adds `_id` if missing."""
+        if '_id' not in doc:
+            doc['_id'] = ObjectId()
+
+        _id = doc['_id']
+
+        class InsertResult:
+            def __init__(self, inserted_id):
+                self.inserted_id = inserted_id
+
+        self.data[str(_id)] = doc
+        return InsertResult(_id)
+    
+    def update_one(self, query, update):
+        """Update first matching document."""
+        doc = self.find_one(query)
+
+        class UpdateResult:
+            matched_count = 0
+            modified_count = 0
+
+        result = UpdateResult()
+        if not doc:
+            return result
+
+        if '$set' in update:
+            for k, v in update['$set'].items():
+                doc[k] = v
+
+        if '$inc' in update:
+            for k, v in update['$inc'].items():
+                doc[k] = (doc.get(k, 0) or 0) + v
+
+        result.matched_count = 1
+        result.modified_count = 1
+        return result
+    
+    def delete_one(self, query):
+        """Mock delete_one"""
+        to_delete = None
+        for key, doc in self.data.items():
+            if self._matches(doc, query):
+                to_delete = key
+                break
+
+        class DeleteResult:
+            deleted_count = 0
+
+        result = DeleteResult()
+        if to_delete is not None:
+            del self.data[to_delete]
+            result.deleted_count = 1
+        return result
+    
+    def count_documents(self, query):
+        """Mock count_documents"""
+        return len(self.find(query))
+    
+    def create_index(self, *args, **kwargs):
+        """Mock create_index"""
+        pass
+    
+    def update_many(self, query, update):
+        """Mock update_many"""
+        matched = 0
+        modified = 0
+        for doc in self.data.values():
+            if self._matches(doc, query):
+                matched += 1
+                if '$set' in update:
+                    for k, v in update['$set'].items():
+                        doc[k] = v
+                if '$inc' in update:
+                    for k, v in update['$inc'].items():
+                        doc[k] = (doc.get(k, 0) or 0) + v
+                modified += 1
+
+        class UpdateResult:
+            matched_count = matched
+            modified_count = modified
+
+        return UpdateResult()
+    
+    def delete_many(self, query):
+        """Mock delete_many"""
+        keys = [k for k, doc in self.data.items() if self._matches(doc, query)]
+        for k in keys:
+            del self.data[k]
+
+        class DeleteResult:
+            deleted_count = len(keys)
+
+        return DeleteResult()
 
 def connect_mongodb():
-    """Try multiple methods to connect to MongoDB."""
-    global client, db
+    """Connect to MongoDB Atlas with proper error handling."""
+    global client, db, mongo_connected, users_col, predictions_col, password_resets, login_attempts_col
     
-    # Method 1: Standard connection with certifi
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000,
-                             tls=True, tlsCAFile=certifi.where())
+        print("[INFO] Attempting MongoDB Atlas connection...")
+
+        # In production (e.g., Vercel/Linux), use strict TLS + certifi.
+        # In local Windows dev, Atlas TLS can fail due to local SSL stack issues;
+        # we fall back to MockCollection in that case.
+        is_production = (os.environ.get('FLASK_ENV') == 'production') or (os.environ.get('VERCEL') == '1')
+
+        mongo_kwargs = dict(
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=5000,
+            retryWrites=True,
+            w='majority',
+        )
+
+        if is_production:
+            mongo_kwargs.update(
+                tls=True,
+                tlsCAFile=certifi.where(),
+                tlsAllowInvalidCertificates=False,
+                tlsAllowInvalidHostnames=False,
+            )
+        else:
+            mongo_kwargs.update(
+                tls=True,
+                tlsAllowInvalidCertificates=True,
+                tlsAllowInvalidHostnames=True,
+            )
+
+        client = MongoClient(MONGO_URI, **mongo_kwargs)
+        
+        # Force actual connection by trying to ping the server
         client.admin.command('ping')
+        
+        # Get database and collections
         db = client['healthcare_db']
-        print("✅  MongoDB connected (certifi)")
+        users_col = db['users']
+        predictions_col = db['predictions']
+        password_resets = db['password_resets']
+        login_attempts_col = db['login_attempts']
+        
+        # Try to create indexes
+        try:
+            users_col.create_index('username', unique=True, sparse=True)
+            users_col.create_index('email', unique=True, sparse=True)
+            login_attempts_col.create_index('timestamp', expireAfterSeconds=900)
+        except Exception as idx_err:
+            print(f"[WARN] Index creation issue: {idx_err}")
+        
+        mongo_connected = True
+        print("[OK] MongoDB Atlas connected successfully!")
+        
         return True
-    except Exception as e1:
-        pass
-    
-    # Method 2: Connection with custom SSL context (no cert verification)
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000,
-                             tls=True, tlsAllowInvalidCertificates=True,
-                             tlsAllowInvalidHostnames=True)
-        client.admin.command('ping')
-        db = client['healthcare_db']
-        print("✅  MongoDB connected (relaxed SSL)")
-        return True
-    except Exception as e2:
-        pass
-    
-    # Method 3: Try without explicit TLS settings
-    try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
-        client.admin.command('ping')
-        db = client['healthcare_db']
-        print("✅  MongoDB connected (auto SSL)")
-        return True
-    except Exception as e3:
-        print(f"⚠️   MongoDB Atlas connection failed.")
-        print(f"    This is likely due to:")
-        print(f"    1. Your IP not whitelisted in MongoDB Atlas")
-        print(f"    2. Python SSL/TLS compatibility issues")
-        print(f"    3. Network/firewall blocking the connection")
-        print(f"    → Go to MongoDB Atlas → Network Access → Add your IP")
-        print(f"    → Or whitelist 0.0.0.0/0 for development")
-    
-    return False
+        
+    except Exception as e:
+        error_str = str(e)[:100]
+        print(f"[ERROR] MongoDB connection failed: {error_str}")
+        print("[INFO] Using in-memory database fallback for testing...")
+        
+        # Use in-memory database for development
+        try:
+            users_col = MockCollection('users')
+            predictions_col = MockCollection('predictions')
+            password_resets = MockCollection('password_resets')
+            login_attempts_col = MockCollection('login_attempts')
+            mongo_connected = False  # Mark as not using real MongoDB
+            print("[OK] In-memory database ready for testing")
+            return False
+        except Exception as fallback_err:
+            print(f"[ERROR] Fallback failed: {fallback_err}")
+            return False
 
 # Try to connect
-if not connect_mongodb():
-    db = None
-    print("⚠️   Running in OFFLINE mode - database features disabled")
-
-# Collections (will be None if offline)
-if db is not None:
-    users_col        = db['users']
-    predictions_col  = db['predictions']
-    password_resets   = db['password_resets']
-    login_attempts_col = db['login_attempts']
-    
-    try:
-        users_col.create_index('username', unique=True, sparse=True)
-        users_col.create_index('email',    unique=True, sparse=True)
-        login_attempts_col.create_index('timestamp', expireAfterSeconds=900)
-        print("✅  MongoDB indexes ready")
-    except Exception as e:
-        print(f"⚠️   Index creation issue: {e}")
-else:
-    # Offline mode - create placeholder collections
-    users_col = None
-    predictions_col = None
-    password_resets = None
-    login_attempts_col = None
+connect_mongodb()
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Load ML Models  (Heart Disease  +  Diabetes)
@@ -159,18 +312,18 @@ def load_models():
         p = os.path.join(MODEL_DIR, name)
         if os.path.exists(p):
             heart_model = joblib.load(p)
-            print(f"✅  Heart disease model loaded  ({name})")
+            print(f"[OK] Heart disease model loaded ({name})")
             break
     else:
-        print("⚠️   Heart disease model not found")
+        print("[WARN] Heart disease model not found")
 
     # Diabetes model
     dp = os.path.join(MODEL_DIR, 'diabetes_model.pkl')
     if os.path.exists(dp):
         diabetes_model = joblib.load(dp)
-        print("✅  Diabetes risk model loaded")
+        print("[OK] Diabetes risk model loaded")
     else:
-        print("⚠️   Diabetes model not found – heart-only mode")
+        print("[WARN] Diabetes model not found - heart-only mode")
 
     mp = os.path.join(MODEL_DIR, 'model_meta.pkl')
     if os.path.exists(mp):
@@ -198,6 +351,8 @@ def security_middleware():
         tok = session.get('csrf_token')
         ftk = request.form.get('csrf_token') or request.headers.get('X-CSRF-Token')
         if not tok or tok != ftk:
+            # Invalidate old token and force a fresh one on next page load
+            session.pop('csrf_token', None)
             flash('Security token expired – please try again.', 'danger')
             return redirect(request.referrer or url_for('home'))
 
@@ -318,6 +473,173 @@ def get_health_grade(score):
     return 'F', 'Critical – See a Doctor'
 
 
+def analyze_symptoms(symptoms_text):
+    """Analyze symptoms text and return disease-specific risk assessment."""
+    symptoms_text = symptoms_text.lower().strip()
+    
+    # Comprehensive symptom database with disease associations
+    symptom_database = {
+        # Cardiovascular & Hypertension symptoms
+        'chest pain': {'diseases': ['Heart Disease', 'Hypertension'], 'severity': 'High', 'risk_score': 25},
+        'chest tightness': {'diseases': ['Heart Disease', 'Hypertension'], 'severity': 'High', 'risk_score': 20},
+        'heart palpitations': {'diseases': ['Heart Disease', 'Hypertension'], 'severity': 'Medium', 'risk_score': 15},
+        'irregular heartbeat': {'diseases': ['Heart Disease', 'Hypertension'], 'severity': 'High', 'risk_score': 20},
+        'shortness of breath': {'diseases': ['Heart Disease', 'Asthma', 'Respiratory Disease'], 'severity': 'High', 'risk_score': 18},
+        'high blood pressure': {'diseases': ['Hypertension', 'Heart Disease', 'Chronic Kidney Disease'], 'severity': 'High', 'risk_score': 22},
+        
+        # Respiratory & Asthma symptoms
+        'breathing difficulty': {'diseases': ['Asthma', 'Respiratory Disease', 'Heart Disease'], 'severity': 'High', 'risk_score': 20},
+        'wheezing': {'diseases': ['Asthma', 'Respiratory Disease'], 'severity': 'Medium', 'risk_score': 18},
+        'persistent cough': {'diseases': ['Asthma', 'Respiratory Disease', 'Cancer'], 'severity': 'Medium', 'risk_score': 15},
+        'cough': {'diseases': ['Respiratory Disease', 'Asthma'], 'severity': 'Low', 'risk_score': 8},
+        'chest congestion': {'diseases': ['Respiratory Disease', 'Asthma'], 'severity': 'Medium', 'risk_score': 12},
+        'rapid breathing': {'diseases': ['Asthma', 'Respiratory Disease'], 'severity': 'High', 'risk_score': 16},
+        
+        # Kidney Disease symptoms
+        'frequent urination': {'diseases': ['Chronic Kidney Disease', 'Diabetes'], 'severity': 'Medium', 'risk_score': 15},
+        'blood in urine': {'diseases': ['Chronic Kidney Disease', 'Cancer'], 'severity': 'High', 'risk_score': 25},
+        'foamy urine': {'diseases': ['Chronic Kidney Disease'], 'severity': 'Medium', 'risk_score': 18},
+        'swelling in legs': {'diseases': ['Chronic Kidney Disease', 'Heart Disease'], 'severity': 'Medium', 'risk_score': 16},
+        'swelling in ankles': {'diseases': ['Chronic Kidney Disease', 'Heart Disease'], 'severity': 'Medium', 'risk_score': 16},
+        'swelling in feet': {'diseases': ['Chronic Kidney Disease', 'Heart Disease'], 'severity': 'Medium', 'risk_score': 16},
+        'decreased urine output': {'diseases': ['Chronic Kidney Disease'], 'severity': 'High', 'risk_score': 20},
+        
+        # Liver Disease symptoms
+        'jaundice': {'diseases': ['Liver Disease', 'Cancer'], 'severity': 'High', 'risk_score': 25},
+        'yellow skin': {'diseases': ['Liver Disease'], 'severity': 'High', 'risk_score': 25},
+        'yellow eyes': {'diseases': ['Liver Disease'], 'severity': 'High', 'risk_score': 25},
+        'abdominal swelling': {'diseases': ['Liver Disease', 'Cancer'], 'severity': 'High', 'risk_score': 20},
+        'dark urine': {'diseases': ['Liver Disease', 'Chronic Kidney Disease'], 'severity': 'Medium', 'risk_score': 15},
+        'pale stool': {'diseases': ['Liver Disease'], 'severity': 'Medium', 'risk_score': 15},
+        'itchy skin': {'diseases': ['Liver Disease'], 'severity': 'Low', 'risk_score': 10},
+        'easy bruising': {'diseases': ['Liver Disease', 'Cancer'], 'severity': 'Medium', 'risk_score': 14},
+        
+        # Cancer symptoms
+        'unexplained weight loss': {'diseases': ['Cancer', 'Diabetes', 'Liver Disease'], 'severity': 'High', 'risk_score': 22},
+        'persistent fatigue': {'diseases': ['Cancer', 'Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 14},
+        'lump': {'diseases': ['Cancer'], 'severity': 'High', 'risk_score': 25},
+        'unusual bleeding': {'diseases': ['Cancer'], 'severity': 'High', 'risk_score': 25},
+        'persistent pain': {'diseases': ['Cancer'], 'severity': 'Medium', 'risk_score': 15},
+        'night sweats': {'diseases': ['Cancer', 'Infection'], 'severity': 'Medium', 'risk_score': 14},
+        'loss of appetite': {'diseases': ['Cancer', 'Liver Disease', 'Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 12},
+        'skin changes': {'diseases': ['Cancer'], 'severity': 'Medium', 'risk_score': 15},
+        
+        # Obesity-related symptoms
+        'excessive weight gain': {'diseases': ['Obesity', 'Metabolic Disorder'], 'severity': 'Medium', 'risk_score': 15},
+        'difficulty exercising': {'diseases': ['Obesity', 'Heart Disease'], 'severity': 'Low', 'risk_score': 10},
+        'sleep apnea': {'diseases': ['Obesity', 'Respiratory Disease'], 'severity': 'High', 'risk_score': 18},
+        'joint pain': {'diseases': ['Obesity', 'Arthritis'], 'severity': 'Medium', 'risk_score': 10},
+        'back pain': {'diseases': ['Obesity'], 'severity': 'Low', 'risk_score': 8},
+        
+        # Mental Health symptoms
+        'anxiety': {'diseases': ['Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 14},
+        'depression': {'diseases': ['Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 14},
+        'panic attacks': {'diseases': ['Mental Health Disorder'], 'severity': 'High', 'risk_score': 18},
+        'mood swings': {'diseases': ['Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 12},
+        'difficulty concentrating': {'diseases': ['Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 10},
+        'insomnia': {'diseases': ['Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 12},
+        'social withdrawal': {'diseases': ['Mental Health Disorder'], 'severity': 'Medium', 'risk_score': 13},
+        
+        # Diabetes symptoms
+        'excessive thirst': {'diseases': ['Diabetes', 'Chronic Kidney Disease'], 'severity': 'Medium', 'risk_score': 15},
+        'increased hunger': {'diseases': ['Diabetes'], 'severity': 'Low', 'risk_score': 10},
+        'blurred vision': {'diseases': ['Diabetes', 'Hypertension'], 'severity': 'Medium', 'risk_score': 15},
+        'slow healing wounds': {'diseases': ['Diabetes'], 'severity': 'Medium', 'risk_score': 14},
+        'numbness in hands': {'diseases': ['Diabetes', 'Neurological'], 'severity': 'Medium', 'risk_score': 15},
+        'numbness in feet': {'diseases': ['Diabetes', 'Neurological'], 'severity': 'Medium', 'risk_score': 15},
+        'tingling': {'diseases': ['Diabetes', 'Neurological'], 'severity': 'Medium', 'risk_score': 12},
+        
+        # General symptoms
+        'fatigue': {'diseases': ['General', 'Diabetes', 'Heart Disease'], 'severity': 'Low', 'risk_score': 8},
+        'weakness': {'diseases': ['General', 'Chronic Kidney Disease'], 'severity': 'Low', 'risk_score': 10},
+        'dizziness': {'diseases': ['Hypertension', 'Heart Disease'], 'severity': 'Medium', 'risk_score': 12},
+        'nausea': {'diseases': ['Liver Disease', 'Chronic Kidney Disease'], 'severity': 'Low', 'risk_score': 8},
+        'vomiting': {'diseases': ['Liver Disease', 'Chronic Kidney Disease'], 'severity': 'Medium', 'risk_score': 12},
+        'fever': {'diseases': ['Infection'], 'severity': 'Medium', 'risk_score': 12},
+        'headache': {'diseases': ['Hypertension', 'General'], 'severity': 'Low', 'risk_score': 8},
+        'severe headache': {'diseases': ['Hypertension'], 'severity': 'High', 'risk_score': 18},
+        'confusion': {'diseases': ['Chronic Kidney Disease', 'Liver Disease'], 'severity': 'High', 'risk_score': 20},
+        'memory loss': {'diseases': ['Neurological'], 'severity': 'High', 'risk_score': 16},
+    }
+    
+    detected_symptoms = []
+    disease_risks = {}  # Track risk scores per disease
+    
+    # Initialize disease tracking
+    all_diseases = [
+        'Cancer', 'Obesity', 'Hypertension', 'Chronic Kidney Disease',
+        'Asthma', 'Respiratory Disease', 'Liver Disease', 'Mental Health Disorder',
+        'Heart Disease', 'Diabetes'
+    ]
+    
+    for disease in all_diseases:
+        disease_risks[disease] = {'score': 0, 'symptoms': []}
+    
+    # Analyze the symptoms text
+    for symptom, info in symptom_database.items():
+        if symptom in symptoms_text:
+            detected_symptoms.append({
+                'name': symptom.title(),
+                'diseases': info['diseases'],
+                'severity': info['severity'],
+                'risk_score': info['risk_score']
+            })
+            
+            # Add to disease-specific risks
+            for disease in info['diseases']:
+                if disease in disease_risks:
+                    disease_risks[disease]['score'] += info['risk_score']
+                    disease_risks[disease]['symptoms'].append(symptom.title())
+    
+    # Calculate overall risk and identify primary diseases
+    total_risk_score = sum(symptom['risk_score'] for symptom in detected_symptoms)
+    
+    # Determine which diseases have significant risk
+    diseases_at_risk = []
+    for disease, data in disease_risks.items():
+        if data['score'] > 0:
+            risk_level = 'High' if data['score'] >= 30 else 'Medium' if data['score'] >= 15 else 'Low'
+            diseases_at_risk.append({
+                'name': disease,
+                'risk_score': data['score'],
+                'risk_level': risk_level,
+                'symptom_count': len(data['symptoms']),
+                'symptoms': data['symptoms']
+            })
+    
+    # Sort diseases by risk score
+    diseases_at_risk.sort(key=lambda x: x['risk_score'], reverse=True)
+    
+    # Determine overall risk level
+    if total_risk_score >= 50:
+        risk_level = 'Critical Risk'
+        risk_category = 'Critical'
+    elif total_risk_score >= 40:
+        risk_level = 'High Risk'
+        risk_category = 'Significant'
+    elif total_risk_score >= 25:
+        risk_level = 'High Risk'
+        risk_category = 'Moderate'
+    elif total_risk_score >= 15:
+        risk_level = 'Medium Risk'
+        risk_category = 'Mild'
+    elif total_risk_score > 0:
+        risk_level = 'Low Risk'
+        risk_category = 'Minor'
+    else:
+        risk_level = 'No Risk'
+        risk_category = 'Healthy'
+    
+    return {
+        'detected_symptoms': detected_symptoms,
+        'total_risk_score': total_risk_score,
+        'risk_level': risk_level,
+        'risk_category': risk_category,
+        'diseases_at_risk': diseases_at_risk,
+        'symptom_count': len(detected_symptoms)
+    }
+
+
 def generate_health_tips(risk, bp, sugar, bmi, smoking, exercise, alcohol):
     tips = []
     if risk == 'High Risk':
@@ -375,7 +697,7 @@ def send_reset_email(to_email, otp_code):
                 server.send_message(msg)
             return True
         except Exception as e:
-            print(f'⚠️  Email error: {e}')
+            print(f'[WARN] Email error: {e}')
             return False
     else:
         print(f'📧  [DEV] OTP for {to_email}: {otp_code}')
@@ -612,6 +934,14 @@ def dashboard():
     grade, grade_desc = get_health_grade(avg_score)
 
     last = recent[0] if recent else None
+    
+    # Check if there's a new prediction to show risk visualization
+    latest_prediction = session.get('latest_prediction')
+    show_risk_analysis = latest_prediction is not None and latest_prediction.get('show_risk_analysis', False)
+    
+    # Clear the flag after displaying
+    if show_risk_analysis and 'latest_prediction' in session:
+        session['latest_prediction']['show_risk_analysis'] = False
 
     return render_template(
         'dashboard.html',
@@ -625,7 +955,9 @@ def dashboard():
         health_grade=grade,
         health_desc=grade_desc,
         last_login=user.get('last_login'),
-        login_count=user.get('login_count', 0)
+        login_count=user.get('login_count', 0),
+        latest_prediction=latest_prediction,
+        show_risk_analysis=show_risk_analysis
     )
 
 # ── Health Form ──────────────────────────────────────────────────────────────
@@ -641,61 +973,30 @@ def health_form():
 @app.route('/predict', methods=['POST'])
 @login_required
 def predict():
-    disease_type = request.form.get('disease_type', 'heart')
-
-    if disease_type == 'heart' and heart_model is None:
-        flash('Heart disease model not loaded.', 'danger')
-        return redirect(url_for('health_form'))
-    if disease_type == 'diabetes' and diabetes_model is None:
-        flash('Diabetes model not loaded.', 'danger')
-        return redirect(url_for('health_form'))
+    disease_type = request.form.get('disease_type', 'symptoms')
 
     try:
-        age       = int(request.form.get('age', 30))
-        gender    = int(request.form.get('gender', 0))
-        bp        = int(request.form.get('blood_pressure', 120))
-        sugar     = int(request.form.get('sugar_level', 100))
-        height_cm = float(request.form.get('height', 170))
-        weight_kg = float(request.form.get('weight', 70))
-        symptoms  = request.form.get('symptoms', '')
-        smoking   = 1 if request.form.get('smoking') else 0
-        exercise  = 1 if request.form.get('exercise') else 0
-        alcohol   = 1 if request.form.get('alcohol') else 0
+        age           = int(request.form.get('age', 30))
+        gender        = int(request.form.get('gender', 0))
+        bp            = int(request.form.get('blood_pressure', 120))
+        sugar         = int(request.form.get('sugar_level', 100))
+        height_cm     = float(request.form.get('height', 170))
+        weight_kg     = float(request.form.get('weight', 70))
+        symptoms_text = request.form.get('symptoms', '')
+        symptom_tags  = request.form.getlist('symptom_tags')
+        smoking       = 1 if request.form.get('smoking') else 0
+        exercise      = 1 if request.form.get('exercise') else 0
+        alcohol       = 1 if request.form.get('alcohol') else 0
+
+        # Combine free-text symptoms with checklist selections for overall analysis
+        combined_symptoms_parts = []
+        if symptoms_text:
+            combined_symptoms_parts.append(symptoms_text)
+        if symptom_tags:
+            combined_symptoms_parts.append(' '.join(symptom_tags))
+        symptoms = ' '.join(combined_symptoms_parts).strip()
 
         bmi = round(weight_kg / ((height_cm / 100) ** 2), 1) if height_cm > 0 else 25.0
-        fbs = 1 if sugar > 120 else 0
-
-        chol    = int(sugar * 2.0 + np.random.normal(0, 10))
-        chol    = max(100, min(chol, 400))
-        thalach = max(70, int(220 - age - (10 if smoking else 0) + (15 if exercise else 0)))
-        exang   = 1 if (smoking and not exercise) else 0
-        oldpeak = round(max(0.0, (bp - 120) * 0.03 + (0.5 if smoking else 0)), 1)
-        restecg = 1 if bp > 140 else 0
-        slope   = 1 if age > 55 else 0
-        ca      = min(3, max(0, int((age - 40) / 15)))
-        thal    = 2 if bp > 150 else 1
-
-        features_heart = np.array([[
-            age, gender, bp, chol, fbs, restecg,
-            thalach, exang, oldpeak, slope, ca, thal,
-            smoking, exercise, alcohol, bmi
-        ]])
-
-        if disease_type == 'heart':
-            prediction    = heart_model.predict(features_heart)[0]
-            probabilities = heart_model.predict_proba(features_heart)[0]
-            risk_label    = 'High Risk' if prediction == 1 else 'Low Risk'
-            probability   = round(float(probabilities[1]) * 100, 2)
-            disease_name  = 'Heart Disease'
-        else:
-            # Diabetes uses same feature set
-            prediction    = diabetes_model.predict(features_heart)[0]
-            probabilities = diabetes_model.predict_proba(features_heart)[0]
-            risk_label    = 'High Risk' if prediction == 1 else 'Low Risk'
-            probability   = round(float(probabilities[1]) * 100, 2)
-            disease_name  = 'Diabetes'
-
-        tips = generate_health_tips(risk_label, bp, sugar, bmi, smoking, exercise, alcohol)
 
         input_data_doc = {
             'age': age, 'gender': 'Male' if gender == 1 else 'Female',
@@ -705,6 +1006,153 @@ def predict():
             'smoking': bool(smoking), 'exercise': bool(exercise),
             'alcohol': bool(alcohol)
         }
+
+        # Handle symptom-based analysis
+        if disease_type == 'symptoms':
+            # Analyze symptoms
+            symptom_analysis = analyze_symptoms(symptoms)
+            
+            # Calculate overall risk based on symptoms + vital signs
+            risk_score = symptom_analysis['total_risk_score']
+            
+            # Add risk from vital signs
+            if bp > 160: risk_score += 20
+            elif bp > 140: risk_score += 15
+            elif bp > 130: risk_score += 10
+            
+            if sugar > 200: risk_score += 20
+            elif sugar > 140: risk_score += 15
+            elif sugar > 126: risk_score += 10
+            
+            if bmi > 35: risk_score += 15
+            elif bmi > 30: risk_score += 10
+            elif bmi > 25: risk_score += 5
+            
+            if smoking: risk_score += 15
+            if alcohol: risk_score += 5
+            if not exercise: risk_score += 10
+            
+            # Determine risk level
+            if risk_score >= 50:
+                risk_label = 'High Risk'
+                probability = min(95, 70 + (risk_score - 50) * 0.5)
+            elif risk_score >= 30:
+                risk_label = 'High Risk'
+                probability = min(70, 50 + (risk_score - 30) * 1.0)
+            elif risk_score >= 15:
+                risk_label = 'Medium Risk'
+                probability = 30 + (risk_score - 15) * 1.3
+            elif risk_score > 0:
+                risk_label = 'Low Risk'
+                probability = 10 + risk_score * 1.5
+            else:
+                risk_label = 'Low Risk'
+                probability = 5
+            
+            probability = round(probability, 2)
+            disease_name = 'General Health Assessment'
+            
+            # Generate disease-specific tips based on analysis
+            tips = []
+            if symptom_analysis['symptom_count'] > 0:
+                tips.append(f"🔍 Detected {symptom_analysis['symptom_count']} symptom(s)")
+                tips.append(f"⚠️ Overall risk level: {risk_label} with {probability}% risk probability")
+                
+                # Add disease-specific recommendations
+                diseases_at_risk = symptom_analysis.get('diseases_at_risk', [])
+                if diseases_at_risk:
+                    tips.append(f"🏥 Potential health concerns detected in {len(diseases_at_risk)} area(s):")
+                    
+                    for disease_risk in diseases_at_risk[:5]:  # Show top 5
+                        disease = disease_risk['name']
+                        d_risk_level = disease_risk['risk_level']
+                        symptom_count = disease_risk['symptom_count']
+                        
+                        if disease == 'Cancer':
+                            tips.append(f'🔬 Cancer Risk: {d_risk_level} - {symptom_count} warning sign(s) detected. Consult oncologist for screening.')
+                        elif disease == 'Hypertension':
+                            tips.append(f'💊 Hypertension Risk: {d_risk_level} - {symptom_count} symptom(s). Monitor blood pressure regularly.')
+                        elif disease == 'Chronic Kidney Disease':
+                            tips.append(f'🔬 Kidney Disease Risk: {d_risk_level} - {symptom_count} symptom(s). Get kidney function tests.')
+                        elif disease == 'Asthma' or disease == 'Respiratory Disease':
+                            tips.append(f'🫁 Respiratory Risk: {d_risk_level} - {symptom_count} symptom(s). See pulmonologist for evaluation.')
+                        elif disease == 'Liver Disease':
+                            tips.append(f'🏥 Liver Health Risk: {d_risk_level} - {symptom_count} symptom(s). Get liver function tests.')
+                        elif disease == 'Mental Health Disorder':
+                            tips.append(f'🧠 Mental Health Concern: {d_risk_level} - {symptom_count} symptom(s). Consider consulting a mental health professional.')
+                        elif disease == 'Obesity':
+                            tips.append(f'⚖️ Weight Management: {d_risk_level} - {symptom_count} related symptom(s). Consult nutritionist for weight management plan.')
+                        elif disease == 'Heart Disease':
+                            tips.append(f'❤️ Cardiovascular Risk: {d_risk_level} - {symptom_count} symptom(s). See cardiologist for evaluation.')
+                        elif disease == 'Diabetes':
+                            tips.append(f'🩸 Diabetes Risk: {d_risk_level} - {symptom_count} symptom(s). Monitor blood sugar and consult endocrinologist.')
+                else:
+                    tips.append('✅ No specific disease patterns detected from symptoms alone.')
+                    
+            tips.extend(generate_health_tips(risk_label, bp, sugar, bmi, smoking, exercise, alcohol))
+            
+            # Store symptom analysis in session for detailed visualization
+            input_data_doc['symptom_analysis'] = symptom_analysis
+            
+        # Handle ML-based disease predictions
+        elif disease_type == 'heart':
+            if heart_model is None:
+                flash('Heart disease model not loaded.', 'danger')
+                return redirect(url_for('health_form'))
+                
+            fbs = 1 if sugar > 120 else 0
+            chol    = int(sugar * 2.0 + np.random.normal(0, 10))
+            chol    = max(100, min(chol, 400))
+            thalach = max(70, int(220 - age - (10 if smoking else 0) + (15 if exercise else 0)))
+            exang   = 1 if (smoking and not exercise) else 0
+            oldpeak = round(max(0.0, (bp - 120) * 0.03 + (0.5 if smoking else 0)), 1)
+            restecg = 1 if bp > 140 else 0
+            slope   = 1 if age > 55 else 0
+            ca      = min(3, max(0, int((age - 40) / 15)))
+            thal    = 2 if bp > 150 else 1
+
+            features_heart = np.array([[
+                age, gender, bp, chol, fbs, restecg,
+                thalach, exang, oldpeak, slope, ca, thal,
+                smoking, exercise, alcohol, bmi
+            ]])
+
+            prediction    = heart_model.predict(features_heart)[0]
+            probabilities = heart_model.predict_proba(features_heart)[0]
+            risk_label    = 'High Risk' if prediction == 1 else 'Low Risk'
+            probability   = round(float(probabilities[1]) * 100, 2)
+            disease_name  = 'Heart Disease'
+            tips = generate_health_tips(risk_label, bp, sugar, bmi, smoking, exercise, alcohol)
+            
+        elif disease_type == 'diabetes':
+            if diabetes_model is None:
+                flash('Diabetes model not loaded.', 'danger')
+                return redirect(url_for('health_form'))
+                
+            fbs = 1 if sugar > 120 else 0
+            chol    = int(sugar * 2.0 + np.random.normal(0, 10))
+            chol    = max(100, min(chol, 400))
+            thalach = max(70, int(220 - age - (10 if smoking else 0) + (15 if exercise else 0)))
+            exang   = 1 if (smoking and not exercise) else 0
+            oldpeak = round(max(0.0, (bp - 120) * 0.03 + (0.5 if smoking else 0)), 1)
+            restecg = 1 if bp > 140 else 0
+            slope   = 1 if age > 55 else 0
+            ca      = min(3, max(0, int((age - 40) / 15)))
+            thal    = 2 if bp > 150 else 1
+
+            features_heart = np.array([[
+                age, gender, bp, chol, fbs, restecg,
+                thalach, exang, oldpeak, slope, ca, thal,
+                smoking, exercise, alcohol, bmi
+            ]])
+            
+            # Diabetes uses same feature set
+            prediction    = diabetes_model.predict(features_heart)[0]
+            probabilities = diabetes_model.predict_proba(features_heart)[0]
+            risk_label    = 'High Risk' if prediction == 1 else 'Low Risk'
+            probability   = round(float(probabilities[1]) * 100, 2)
+            disease_name  = 'Diabetes'
+            tips = generate_health_tips(risk_label, bp, sugar, bmi, smoking, exercise, alcohol)
 
         health_score = calculate_health_score(input_data_doc)
         hs_grade, hs_desc = get_health_grade(health_score)
@@ -720,22 +1168,26 @@ def predict():
             'tips':         tips,
             'timestamp':    datetime.utcnow()
         }
-        predictions_col.insert_one(pred_doc)
-
-        return render_template(
-            'result.html',
-            username=session['username'],
-            result=risk_label,
-            probability=probability,
-            input_data=input_data_doc,
-            tips=tips,
-            disease_type=disease_type,
-            disease_name=disease_name,
-            health_score=health_score,
-            health_grade=hs_grade,
-            health_desc=hs_desc,
-            timestamp=pred_doc['timestamp'].strftime('%B %d, %Y  %H:%M')
-        )
+        result = predictions_col.insert_one(pred_doc)
+        
+        # Store the latest prediction in session for dashboard display
+        session['latest_prediction'] = {
+            'prediction_id': str(result.inserted_id),
+            'disease_type': disease_type,
+            'disease_name': disease_name,
+            'result': risk_label,
+            'probability': probability,
+            'input_data': input_data_doc,
+            'health_score': health_score,
+            'health_grade': hs_grade,
+            'health_desc': hs_desc,
+            'tips': tips,
+            'timestamp': pred_doc['timestamp'].strftime('%B %d, %Y  %H:%M'),
+            'show_risk_analysis': True
+        }
+        
+        flash(f'✅ {disease_name} complete! Risk Level: {risk_label} ({probability}%)', 'success')
+        return redirect(url_for('dashboard'))
 
     except Exception as e:
         flash(f'Prediction error: {str(e)}', 'danger')
@@ -990,6 +1442,149 @@ def api_health_score():
         'description': desc
     })
 
+
+@app.route('/api/risk-visualization')
+@login_required
+def api_risk_visualization():
+    """Get risk visualization data for the latest prediction."""
+    prediction_data = session.get('latest_prediction')
+    
+    if not prediction_data:
+        # Fallback: get the most recent prediction from database
+        uid = session['user_id']
+        recent_pred = predictions_col.find_one({'user_id': uid}, sort=[('timestamp', -1)])
+        if not recent_pred:
+            return jsonify({'error': 'No prediction data available'}), 404
+        
+        input_data = recent_pred.get('input_data', {})
+        prediction_data = {
+            'disease_type': recent_pred.get('disease_type', 'heart'),
+            'disease_name': recent_pred.get('disease_name', 'Heart Disease'),
+            'result': recent_pred.get('result', 'Unknown'),
+            'probability': recent_pred.get('probability', 0),
+            'health_score': recent_pred.get('health_score', 0),
+            'input_data': input_data
+        }
+    
+    input_data = prediction_data.get('input_data', {})
+    
+    # Risk factors analysis
+    risk_factors = []
+    
+    # Age factor
+    age = input_data.get('age', 30)
+    if age > 65:
+        risk_factors.append({'name': 'Age', 'value': age, 'risk': 'High', 'impact': 25})
+    elif age > 50:
+        risk_factors.append({'name': 'Age', 'value': age, 'risk': 'Medium', 'impact': 15})
+    else:
+        risk_factors.append({'name': 'Age', 'value': age, 'risk': 'Low', 'impact': 5})
+    
+    # Blood Pressure factor
+    bp = input_data.get('blood_pressure', 120)
+    if bp > 160:
+        risk_factors.append({'name': 'Blood Pressure', 'value': f'{bp} mmHg', 'risk': 'High', 'impact': 30})
+    elif bp > 140:
+        risk_factors.append({'name': 'Blood Pressure', 'value': f'{bp} mmHg', 'risk': 'Medium', 'impact': 20})
+    else:
+        risk_factors.append({'name': 'Blood Pressure', 'value': f'{bp} mmHg', 'risk': 'Low', 'impact': 8})
+    
+    # Sugar level factor
+    sugar = input_data.get('sugar_level', 100)
+    if sugar > 200:
+        risk_factors.append({'name': 'Blood Sugar', 'value': f'{sugar} mg/dl', 'risk': 'High', 'impact': 25})
+    elif sugar > 140:
+        risk_factors.append({'name': 'Blood Sugar', 'value': f'{sugar} mg/dl', 'risk': 'Medium', 'impact': 15})
+    else:
+        risk_factors.append({'name': 'Blood Sugar', 'value': f'{sugar} mg/dl', 'risk': 'Low', 'impact': 5})
+    
+    # BMI factor
+    bmi = input_data.get('bmi', 24.0)
+    if bmi > 30:
+        risk_factors.append({'name': 'BMI', 'value': f'{bmi:.1f}', 'risk': 'High', 'impact': 20})
+    elif bmi > 25:
+        risk_factors.append({'name': 'BMI', 'value': f'{bmi:.1f}', 'risk': 'Medium', 'impact': 10})
+    else:
+        risk_factors.append({'name': 'BMI', 'value': f'{bmi:.1f}', 'risk': 'Low', 'impact': 3})
+    
+    # Lifestyle factors
+    if input_data.get('smoking'):
+        risk_factors.append({'name': 'Smoking', 'value': 'Yes', 'risk': 'High', 'impact': 25})
+    else:
+        risk_factors.append({'name': 'Smoking', 'value': 'No', 'risk': 'Low', 'impact': 0})
+    
+    if not input_data.get('exercise'):
+        risk_factors.append({'name': 'Exercise', 'value': 'No Regular Exercise', 'risk': 'Medium', 'impact': 15})
+    else:
+        risk_factors.append({'name': 'Exercise', 'value': 'Regular Exercise', 'risk': 'Low', 'impact': 0})
+    
+    # Risk distribution for pie chart
+    total_risk = sum(factor['impact'] for factor in risk_factors)
+    safe_score = max(0, 100 - total_risk)
+    
+    # Check for detailed symptom analysis
+    symptom_analysis = input_data.get('symptom_analysis')
+    detected_symptoms_data = []
+    diseases_at_risk = []
+    
+    if symptom_analysis and symptom_analysis.get('detected_symptoms'):
+        # Add detected symptoms as risk factors
+        for symptom in symptom_analysis['detected_symptoms']:
+            diseases_list = ', '.join(symptom.get('diseases', ['General']))
+            risk_factors.append({
+                'name': symptom['name'],
+                'value': diseases_list,
+                'risk': symptom['severity'],
+                'impact': symptom['risk_score']
+            })
+            detected_symptoms_data.append(symptom)
+        
+        # Get disease-specific risks
+        diseases_at_risk = symptom_analysis.get('diseases_at_risk', [])
+        
+        total_risk = sum(factor['impact'] for factor in risk_factors)
+        safe_score = max(0, 100 - total_risk)
+    
+    # Fallback symptom analysis for older predictions
+    elif input_data.get('symptoms'):
+        symptoms_text = input_data['symptoms'].lower()
+        high_risk_symptoms = ['chest pain', 'shortness of breath', 'fatigue', 'dizziness', 'nausea']
+        for symptom in high_risk_symptoms:
+            if symptom in symptoms_text:
+                risk_factors.append({'name': symptom.title(), 'value': 'Detected', 'risk': 'High', 'impact': 10})
+                total_risk += 10
+        safe_score = max(0, 100 - total_risk)
+    
+    response_data = {
+        'prediction': {
+            'disease_name': prediction_data.get('disease_name', 'Heart Disease'),
+            'risk_level': prediction_data.get('result', 'Unknown'),
+            'probability': prediction_data.get('probability', 0),
+            'health_score': prediction_data.get('health_score', 0)
+        },
+        'risk_factors': risk_factors,
+        'risk_distribution': {
+            'high_risk': total_risk,
+            'safe_zone': safe_score
+        },
+        'charts': {
+            'risk_breakdown': [
+                {'label': 'Risk Factors', 'value': total_risk, 'color': '#dc3545'},
+                {'label': 'Safe Zone', 'value': safe_score, 'color': '#28a745'}
+            ],
+            'factor_impact': risk_factors
+        }
+    }
+    
+    # Add detailed symptom and disease data if available
+    if detected_symptoms_data:
+        response_data['detected_symptoms'] = detected_symptoms_data
+    
+    if diseases_at_risk:
+        response_data['diseases_at_risk'] = diseases_at_risk
+    
+    return jsonify(response_data)
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Error Handlers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1005,9 +1600,9 @@ def server_error(e):
 #  Run
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    print("🚀  Starting Healthcare Analysis Server (Enhanced) …")
-    print("    → http://localhost:5000")
-    print(f"    → CSRF protection: ON")
-    print(f"    → Login rate-limit: {MAX_LOGIN_ATTEMPTS} attempts / {LOCKOUT_DURATION.seconds//60} min")
-    print(f"    → Session timeout:  {SESSION_TIMEOUT.seconds//60} min")
+    print("[START] Healthcare Analysis Server (Enhanced)")
+    print(f"    URL: http://localhost:5000")
+    print(f"    CSRF protection: ON")
+    print(f"    Login rate-limit: {MAX_LOGIN_ATTEMPTS} attempts / {LOCKOUT_DURATION.seconds//60} min")
+    print(f"    Session timeout: {SESSION_TIMEOUT.seconds//60} min")
     app.run(debug=True, host='0.0.0.0', port=5000)
